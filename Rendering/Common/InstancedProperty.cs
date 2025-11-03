@@ -19,7 +19,7 @@ namespace NSprites
         internal ComputeBuffer ComputeBuffer;
 
         private JobHandle _handle;
-        private bool _wasScheduled;
+        internal bool _wasScheduled;
         private int _writeBytesCount;
         
 #if UNITY_EDITOR || DEVELOPEMENT_BUILD
@@ -131,14 +131,14 @@ namespace NSprites
         }
 
         /// <summary> Ends write into <see cref="ComputeBuffer"/>. Any jobs which writes into buffer should be completed. </summary>
-        private void EndWrite()
+        internal void EndWrite()
         {
 #if UNITY_EDITOR || DEVELOPEMENT_BUILD
             if (!IsWriting)
                 throw new NSpritesException($"{nameof(InstancedProperty)} {ComponentType.GetManagedType().Name} isn't writing to buffer. Calling to {nameof(EndWrite)} before writing to buffer isn't allowed.");
             IsWriting = false;
 #endif
-            
+
             ComputeBuffer.EndWrite<byte>(_writeBytesCount);
         }
 

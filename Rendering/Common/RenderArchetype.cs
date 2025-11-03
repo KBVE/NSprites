@@ -548,9 +548,50 @@ namespace NSprites
         /// <summary>Forces complete all properties update jobs. Call it after <see cref="ScheduleUpdate"/> and before <see cref="Draw"/> method to ensure all data is updated.</summary>
         private void CompleteUpdate()
         {
-            // NOTE: Completion is now handled by SpriteRenderingSystem before calling CompleteAndDraw().
-            // This method is kept for API compatibility but performs no operations.
-            // All job handles are completed in a single fence in SpriteRenderingSystem.OnUpdate().
+            // NOTE: Job completion is now handled by SpriteRenderingSystem before calling CompleteAndDraw().
+            // However, we still need to call EndWrite() on each property to finalize the compute buffer writes
+            // and reset the state flags for the next frame.
+
+#if !NSPRITES_REACTIVE_DISABLE
+            // finalize reactive properties buffer writes
+            foreach (var props in PropertiesContainer.Reactive)
+            {
+                if (props._wasScheduled)
+                {
+                    props.EndWrite();
+                    props._wasScheduled = false;
+                }
+            }
+#endif
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            // finalize each-update properties buffer writes
+            foreach (var props in PropertiesContainer.EachUpdate)
+            {
+                if (props._wasScheduled)
+                {
+                    props.EndWrite();
+                    props._wasScheduled = false;
+                }
+            }
+#endif
+#if !NSPRITES_STATIC_DISABLE
+            // finalize static properties buffer writes
+            foreach (var props in PropertiesContainer.Static)
+            {
+                if (props._wasScheduled)
+                {
+                    props.EndWrite();
+                    props._wasScheduled = false;
+                }
+            }
+#endif
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+            if (_shouldHandleReactiveOrStaticProperties && PointersProperty._wasScheduled)
+            {
+                PointersProperty.EndWrite();
+                PointersProperty._wasScheduled = false;
+            }
+#endif
         }
         
         /// <summary>Draws instances in quantity based on the number of entities related to this <see cref="RenderArchetype"/>. Call it after <see cref="ScheduleUpdate"/> and <see cref="CompleteUpdate"/>.</summary>
