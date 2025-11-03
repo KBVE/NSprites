@@ -548,25 +548,9 @@ namespace NSprites
         /// <summary>Forces complete all properties update jobs. Call it after <see cref="ScheduleUpdate"/> and before <see cref="Draw"/> method to ensure all data is updated.</summary>
         private void CompleteUpdate()
         {
-#if !NSPRITES_REACTIVE_DISABLE
-            // complete reactive properties
-            foreach (var props in PropertiesContainer.Reactive)
-                props.Complete();
-#endif
-#if !NSPRITES_EACH_UPDATE_DISABLE
-            // complete each-update properties
-            foreach (var props in PropertiesContainer.EachUpdate)
-                props.Complete();
-#endif
-#if !NSPRITES_STATIC_DISABLE
-            // complete static properties
-            foreach (var props in PropertiesContainer.Static)
-                props.Complete();
-#endif
-#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
-            if (_shouldHandleReactiveOrStaticProperties)
-                PointersProperty.Complete();
-#endif
+            // NOTE: Completion is now handled by SpriteRenderingSystem before calling CompleteAndDraw().
+            // This method is kept for API compatibility but performs no operations.
+            // All job handles are completed in a single fence in SpriteRenderingSystem.OnUpdate().
         }
         
         /// <summary>Draws instances in quantity based on the number of entities related to this <see cref="RenderArchetype"/>. Call it after <see cref="ScheduleUpdate"/> and <see cref="CompleteUpdate"/>.</summary>
