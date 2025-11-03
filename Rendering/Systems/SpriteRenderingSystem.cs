@@ -54,7 +54,7 @@ namespace NSprites
             var count = archetypes.Count;
 
             // schedule all updates
-            using var handles = new NativeArray<JobHandle>(count, Allocator.Temp);
+            var handles = new NativeArray<JobHandle>(count, Allocator.Temp);
             for (int i = 0; i < count; i++)
                 handles[i] = archetypes[i].ScheduleUpdate(systemData, ref state);
 
@@ -64,6 +64,7 @@ namespace NSprites
             // single fence for all property updates
             var all = JobHandle.CombineDependencies(handles);
             state.Dependency = all;
+            handles.Dispose();
 
             // complete ONCE, then draw all archetypes (no per-archetype completes)
             all.Complete();
