@@ -31,31 +31,45 @@ namespace NSprites
         public void OnUpdate(ref SystemState state)
         {
             var renderArchetypeStorage = SystemAPI.ManagedAPI.GetComponent<RenderArchetypeStorage>(state.SystemHandle);
+
 #if UNITY_EDITOR
             if (!Application.isPlaying && renderArchetypeStorage.Quad == null)
                 renderArchetypeStorage.Quad = NSpritesUtils.ConstructQuad();
 #endif
+
             // update state to pass to render archetypes
 #if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
             var systemData = renderArchetypeStorage.SystemData;
-            systemData.LastSystemVersion = state.LastSystemVersion;
-            systemData.PropertyPointer_CTH_RW = SystemAPI.GetComponentTypeHandle<PropertyPointer>(false);
+            systemData.LastSystemVersion           = state.LastSystemVersion;
+            systemData.PropertyPointer_CTH_RW      = SystemAPI.GetComponentTypeHandle<PropertyPointer>(false);
             systemData.PropertyPointerChunk_CTH_RW = SystemAPI.GetComponentTypeHandle<PropertyPointerChunk>(false);
             systemData.PropertyPointerChunk_CTH_RO = SystemAPI.GetComponentTypeHandle<PropertyPointerChunk>(true);
-#endif
+            systemData.InputDeps                   = state.Dependency;
+#else
+            var systemData = renderArchetypeStorage.SystemData;
             systemData.InputDeps = state.Dependency;
+#endif
 
-            // schedule render archetype's properties data update
-            var renderArchetypeHandles = new NativeArray<JobHandle>(renderArchetypeStorage.RenderArchetypes.Count, Allocator.Temp);
-            for (var archetypeIndex = 0; archetypeIndex < renderArchetypeStorage.RenderArchetypes.Count; archetypeIndex++)
-                renderArchetypeHandles[archetypeIndex] = renderArchetypeStorage.RenderArchetypes[archetypeIndex].ScheduleUpdate(systemData, ref state);
-            
-            // force complete properties data update and draw archetypes
-            for (var archetypeIndex = 0; archetypeIndex < renderArchetypeStorage.RenderArchetypes.Count; archetypeIndex++)
-                renderArchetypeStorage.RenderArchetypes[archetypeIndex].CompleteAndDraw();
+            var archetypes = renderArchetypeStorage.RenderArchetypes;
+            var count = archetypes.Count;
 
-            // combine handles from all render archetypes we have updated
-            state.Dependency = JobHandle.CombineDependencies(renderArchetypeHandles);
+            // schedule all updates
+            using var handles = new NativeArray<JobHandle>(count, Allocator.Temp);
+            for (int i = 0; i < count; i++)
+                handles[i] = archetypes[i].ScheduleUpdate(systemData, ref state);
+
+            // push work to worker threads
+            JobHandle.ScheduleBatchedJobs();
+
+            // single fence for all property updates
+            var all = JobHandle.CombineDependencies(handles);
+            state.Dependency = all;
+
+            // complete ONCE, then draw all archetypes (no per-archetype completes)
+            all.Complete();
+
+            for (int i = 0; i < count; i++)
+                archetypes[i].CompleteAndDraw(); // completion is now a no-op; just draws
         }
     }
 }
