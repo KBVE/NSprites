@@ -177,6 +177,16 @@ namespace NSprites
         private ReusableNativeList<int> _reorderedChunksIndexes_RNL;
         // TODO: expose this for client code
         internal const int MinIndicesPerJobCount = 8;
+
+        // Intermediate state for two-phase rendering (calculation → sync)
+        private NativeArray<ArchetypeChunk> _chunksArray;
+        private NativeCounter _overallCapacityCounter;
+        private NativeCounter _createdChunksCapacityCounter;
+        private NativeCounter _entityCounter;
+        private NativeList<int> _createdChunksIndices;
+        private NativeList<int> _reorderedChunksIndices;
+        private JobHandle _calculateChunksDataHandle;
+        private bool _hasScheduledCalculation;
 #endif
 
         public RenderArchetype(Material material, Mesh mesh, in Bounds bounds, IReadOnlyList<PropertyData> propertyDataSet
@@ -234,7 +244,286 @@ namespace NSprites
 #endif
 #endregion
         }
-        
+
+        /// <summary>
+        /// Phase 1: Schedule chunk calculation jobs. Returns handle that must be completed before calling CompleteCalculationAndScheduleSync.
+        /// </summary>
+        public JobHandle ScheduleChunkCalculation(in SystemData systemData, ref SystemState systemState)
+        {
+            var query = systemData.Query;
+            query.SetSharedComponentFilter(new SpriteRenderID { id = ID });
+
+            PropertiesContainer.ResetHandles();
+
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            if (_shouldHandleReactiveOrStaticProperties)
+            {
+#endif
+                // Get chunks array
+                _chunksArray = query.ToArchetypeChunkArray(Allocator.TempJob);
+
+                // Create counters
+                _overallCapacityCounter = new NativeCounter(Allocator.TempJob);
+                _createdChunksCapacityCounter = new NativeCounter(Allocator.TempJob);
+                _entityCounter = new NativeCounter(Allocator.TempJob);
+
+                // Get reusable lists
+                _createdChunksIndices = _createdChunksIndexes_RNL.GetList(_chunksArray.Length);
+                _reorderedChunksIndices = _reorderedChunksIndexes_RNL.GetList(_chunksArray.Length);
+
+                // Schedule calculation job
+                _calculateChunksDataHandle = new CalculateChunksDataJob
+                {
+                    Chunks = _chunksArray,
+                    ChunkCapacityCounter = _overallCapacityCounter,
+                    CreatedChunksCapacityCounter = _createdChunksCapacityCounter,
+                    EntityCounter = _entityCounter,
+                    PropertyPointerChunk_CTH_RO = systemData.PropertyPointerChunk_CTH_RO,
+                    NewChunksIndices = _createdChunksIndices.AsParallelWriter(),
+                    ReorderedChunksIndices = _reorderedChunksIndices.AsParallelWriter(),
+                    LastSystemVersion = systemData.LastSystemVersion
+                }.ScheduleBatch(_chunksArray.Length, MinIndicesPerJobCount);
+
+                _hasScheduledCalculation = true;
+                return _calculateChunksDataHandle;
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            }
+            else
+            {
+                _hasScheduledCalculation = false;
+                return default;
+            }
+#endif
+#else
+            _hasScheduledCalculation = false;
+            return default;
+#endif
+        }
+
+        /// <summary>
+        /// Phase 2: Complete calculation job, make allocation decisions, and schedule property sync jobs.
+        /// Must be called after ScheduleChunkCalculation's handle has been completed externally.
+        /// </summary>
+        public JobHandle CompleteCalculationAndScheduleSync(in SystemData systemData, ref SystemState systemState)
+        {
+            var query = systemData.Query;
+            query.SetSharedComponentFilter(new SpriteRenderID { id = ID });
+
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            if (_hasScheduledCalculation)
+            {
+#endif
+                // Read calculation results
+                _entityCount = _entityCounter.Count;
+                var neededOverallCapacity = _overallCapacityCounter.Count;
+                var createdChunksCapacity = _createdChunksCapacityCounter.Count;
+                var overallCapacityExceeded = neededOverallCapacity > ReactiveAndStaticAllocationCounter.Allocated;
+
+                // Use stored references
+                var chunksArray = _chunksArray;
+                var createdChunksIndices = _createdChunksIndices;
+                var reorderedChunksIndexes = _reorderedChunksIndices;
+
+                #region update capacity, sync data
+                if (overallCapacityExceeded || createdChunksCapacity > ReactiveAndStaticAllocationCounter.Unused)
+                {
+                    var mapHandle = new MapChunksJob
+                    {
+                        Chunks = chunksArray,
+                        PropertyPointerChunk_CTH = systemData.PropertyPointerChunk_CTH_RW
+                    }.Schedule();
+                    mapHandle = new MapEntitiesJob
+                    {
+                        Chunks = chunksArray,
+                        PropertyPointerChunk_CTH = systemData.PropertyPointerChunk_CTH_RO,
+                        PropertyPointer_CTH = systemData.PropertyPointer_CTH_RW
+                    }.ScheduleBatch(chunksArray.Length, MinIndicesPerJobCount, mapHandle);
+
+                    var preReadDependency = JobHandle.CombineDependencies(mapHandle, systemData.InputDeps);
+
+                    #region local methods
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    void SyncByChunks(InstancedProperty property, in ComponentTypeHandle<PropertyPointerChunk> propertyPointerChunk_CTH_RO, DynamicComponentTypeHandle property_DCTH, in JobHandle inputDeps)
+                        => PropertiesContainer.AddHandle(property.SyncByChunks(chunksArray, propertyPointerChunk_CTH_RO, property_DCTH, ReactiveAndStaticAllocationCounter.Used, inputDeps));
+
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    void ReallocateAndSyncManyByChunks(IEnumerable<InstancedProperty> props, in SystemData systemData, ref SystemState systemState)
+                    {
+                        foreach (var prop in props)
+                        {
+                            prop.Reallocate(ReactiveAndStaticAllocationCounter.Allocated, _materialPropertyBlock);
+                            SyncByChunks(prop, systemData.PropertyPointerChunk_CTH_RO, systemState.GetDynamicComponentTypeHandle(prop.ComponentType), preReadDependency);
+                        }
+                    }
+                    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                    void SyncManyByChunks(IEnumerable<InstancedProperty> props, in SystemData systemData, ref SystemState systemState)
+                    {
+                        foreach (var prop in props)
+                            SyncByChunks(prop, systemData.PropertyPointerChunk_CTH_RO, systemState.GetDynamicComponentTypeHandle(prop.ComponentType), preReadDependency);
+                    }
+                    #endregion
+
+                    ReactiveAndStaticAllocationCounter.Used = neededOverallCapacity;
+
+                    if (overallCapacityExceeded)
+                    {
+                        ReactiveAndStaticAllocationCounter.Allocated += math.max(_minCapacityStep, neededOverallCapacity - ReactiveAndStaticAllocationCounter.Allocated);
+
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+                        PointersProperty.Reallocate(ReactiveAndStaticAllocationCounter.Allocated, _materialPropertyBlock);
+                        SyncByQuery(PointersProperty, systemState.GetDynamicComponentTypeHandle(PointersProperty.ComponentType), ref query, preReadDependency);
+#endif
+#if !NSPRITES_REACTIVE_DISABLE
+                        ReallocateAndSyncManyByChunks(PropertiesContainer.Reactive, systemData, ref systemState);
+#endif
+#if !NSPRITES_STATIC_DISABLE
+                        ReallocateAndSyncManyByChunks(PropertiesContainer.Static, systemData, ref systemState);
+#endif
+                    }
+                    else
+                    {
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+                        SyncByQuery(PointersProperty, systemState.GetDynamicComponentTypeHandle(PointersProperty.ComponentType), ref query, preReadDependency);
+#endif
+#if !NSPRITES_REACTIVE_DISABLE
+                        SyncManyByChunks(PropertiesContainer.Reactive, systemData, ref systemState);
+#endif
+#if !NSPRITES_STATIC_DISABLE
+                        SyncManyByChunks(PropertiesContainer.Static, systemData, ref systemState);
+#endif
+                    }
+                }
+                else
+                {
+                    var mapHandle = new MapListedEntitiesJob
+                    {
+                        Chunks = chunksArray,
+                        ChunkIndexes = reorderedChunksIndexes,
+                        PropertyPointerChunk_CTH_RO = systemData.PropertyPointerChunk_CTH_RO,
+                        PropertyPointer_CTH_Wo = systemData.PropertyPointer_CTH_RW
+                    }.ScheduleBatch(reorderedChunksIndexes.Length, MinIndicesPerJobCount);
+
+                    if (createdChunksCapacity > 0)
+                    {
+                        var createdChunksMapHandle = new MapListedChunksJob
+                        {
+                            Chunks = chunksArray,
+                            ChunksIndices = createdChunksIndices,
+                            PropertyPointerChunk_CTH = systemData.PropertyPointerChunk_CTH_RW,
+                            StartingFromIndex = ReactiveAndStaticAllocationCounter.Used
+                        }.Schedule();
+
+                        ReactiveAndStaticAllocationCounter.Used += createdChunksCapacity;
+
+                        createdChunksMapHandle = new MapListedEntitiesJob
+                        {
+                            Chunks = chunksArray,
+                            ChunkIndexes = createdChunksIndices,
+                            PropertyPointerChunk_CTH_RO = systemData.PropertyPointerChunk_CTH_RO,
+                            PropertyPointer_CTH_Wo = systemData.PropertyPointer_CTH_RW
+                        }.ScheduleBatch(createdChunksIndices.Length, MinIndicesPerJobCount, createdChunksMapHandle);
+
+                        mapHandle = JobHandle.CombineDependencies(mapHandle, createdChunksMapHandle);
+                    }
+
+                    var preReadDependency = JobHandle.CombineDependencies(systemData.InputDeps, mapHandle);
+
+#if !NSPRITES_REACTIVE_DISABLE
+                    foreach (var prop in PropertiesContainer.Reactive)
+                    {
+                        var handle = prop.SyncByChangedChunks
+                        (
+                            chunksArray,
+                            systemData.PropertyPointerChunk_CTH_RO,
+                            systemState.GetDynamicComponentTypeHandle(prop.ComponentType),
+                            ReactiveAndStaticAllocationCounter.Used,
+                            systemData.LastSystemVersion,
+                            preReadDependency
+                        );
+                        PropertiesContainer.AddHandle(handle);
+                    }
+#endif
+#if !NSPRITES_STATIC_DISABLE
+                    if (reorderedChunksIndexes.Length > 0 || createdChunksIndices.Length > 0)
+                    {
+                        foreach (var prop in PropertiesContainer.Static)
+                        {
+                            var handle = prop.SyncByCreatedAndReorderedChunks
+                            (
+                                chunksArray,
+                                reorderedChunksIndexes,
+                                createdChunksIndices,
+                                systemData.PropertyPointerChunk_CTH_RO,
+                                systemState.GetDynamicComponentTypeHandle(prop.ComponentType),
+                                ReactiveAndStaticAllocationCounter.Used,
+                                preReadDependency
+                            );
+                            PropertiesContainer.AddHandle(handle);
+                        }
+                    }
+#endif
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+                    SyncByQuery(PointersProperty, systemState.GetDynamicComponentTypeHandle(PointersProperty.ComponentType), ref query, preReadDependency);
+#endif
+                }
+
+#if UNITY_EDITOR || DEVELOPEMENT_BUILD
+                ReactiveAndStaticAllocationCounter.Verify(neededOverallCapacity);
+#endif
+                #endregion
+
+                // Dispose calculation containers
+                _overallCapacityCounter.Dispose();
+                _createdChunksCapacityCounter.Dispose();
+                _entityCounter.Dispose();
+
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            }
+            else
+                _entityCount = query.CalculateEntityCount();
+#endif
+#endif
+
+            #region handle each-update
+#if !NSPRITES_EACH_UPDATE_DISABLE
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+            if (_shouldHandlePropertiesByEntity)
+            {
+#endif
+#if NSPRITES_REACTIVE_DISABLE && NSPRITES_STATIC_DISABLE
+                _entityCount = query.CalculateEntityCount();
+#endif
+                if (_perEntityPropertiesSpaceCounter.Allocated < _entityCount)
+                {
+                    _perEntityPropertiesSpaceCounter.Allocated += math.max(_minCapacityStep, _entityCount - _perEntityPropertiesSpaceCounter.Allocated);
+                    foreach (var prop in PropertiesContainer.EachUpdate)
+                    {
+                        prop.Reallocate(_perEntityPropertiesSpaceCounter.Allocated, _materialPropertyBlock);
+                        SyncByQuery(prop, systemState.GetDynamicComponentTypeHandle(prop.ComponentType), ref query, systemData.InputDeps);
+                    }
+                }
+                else
+                    foreach (var prop in PropertiesContainer.EachUpdate)
+                        SyncByQuery(prop, systemState.GetDynamicComponentTypeHandle(prop.ComponentType), ref query, systemData.InputDeps);
+
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+            }
+#endif
+#endif
+            #endregion
+
+            var outputHandle = PropertiesContainer.GeneralHandle;
+#if !NSPRITES_REACTIVE_DISABLE || !NSPRITES_STATIC_DISABLE
+#if !NSPRITES_EACH_UPDATE_DISABLE
+            if (_hasScheduledCalculation)
+#endif
+                _chunksArray.Dispose(outputHandle);
+#endif
+            return outputHandle;
+        }
+
         public JobHandle ScheduleUpdate(in SystemData systemData, ref SystemState systemState)
         {
             // we need to use this method every new frame, because query somehow gets invalidated

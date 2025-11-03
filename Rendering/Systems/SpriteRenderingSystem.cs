@@ -6,11 +6,12 @@ using UnityEngine;
 namespace NSprites
 {
     /// <summary>
-    /// Renders entities (both in runtime and editor) with <see cref="SpriteRenderID"/> : <see cref="ISharedComponentData"/> as 2D sprites depending on registered data through <see cref="RenderArchetypeStorage.RegisterRender"/>
+    /// Phase 1: Schedules chunk calculation and property sync jobs for sprite rendering.
+    /// Runs before SpriteRenderingDrawSystem in the PresentationSystemGroup.
     /// </summary>
     [WorldSystemFilter(WorldSystemFilterFlags.Default | WorldSystemFilterFlags.Editor)]
     [UpdateInGroup(typeof(PresentationSystemGroup))]
-    public partial struct SpriteRenderingSystem : ISystem
+    public partial struct SpriteRenderingUpdateSystem : ISystem
     {
         public void OnCreate(ref SystemState state)
         {
@@ -45,17 +46,57 @@ namespace NSprites
 #endif
             systemData.InputDeps = state.Dependency;
 
-            // schedule render archetype's properties data update
-            var renderArchetypeHandles = new NativeArray<JobHandle>(renderArchetypeStorage.RenderArchetypes.Count, Allocator.Temp);
-            for (var archetypeIndex = 0; archetypeIndex < renderArchetypeStorage.RenderArchetypes.Count; archetypeIndex++)
-                renderArchetypeHandles[archetypeIndex] = renderArchetypeStorage.RenderArchetypes[archetypeIndex].ScheduleUpdate(systemData, ref state);
+            var archetypes = renderArchetypeStorage.RenderArchetypes;
+            var count = archetypes.Count;
 
-            // force complete properties data update and draw archetypes
-            for (var archetypeIndex = 0; archetypeIndex < renderArchetypeStorage.RenderArchetypes.Count; archetypeIndex++)
-                renderArchetypeStorage.RenderArchetypes[archetypeIndex].CompleteAndDraw();
+            // PHASE 1: Schedule all chunk calculation jobs in parallel
+            var calcHandles = new NativeArray<JobHandle>(count, Allocator.Temp);
+            for (int i = 0; i < count; i++)
+                calcHandles[i] = archetypes[i].ScheduleChunkCalculation(systemData, ref state);
 
-            // combine handles from all render archetypes we have updated
-            state.Dependency = JobHandle.CombineDependencies(renderArchetypeHandles);
+            // Push calculation jobs to worker threads
+            JobHandle.ScheduleBatchedJobs();
+
+            // Complete all calculation jobs ONCE (batched sync point)
+            var allCalcs = JobHandle.CombineDependencies(calcHandles);
+            calcHandles.Dispose();
+            allCalcs.Complete();
+
+            // PHASE 2: Make allocation decisions and schedule property sync jobs
+            var syncHandles = new NativeArray<JobHandle>(count, Allocator.Temp);
+            for (int i = 0; i < count; i++)
+                syncHandles[i] = archetypes[i].CompleteCalculationAndScheduleSync(systemData, ref state);
+
+            // Push sync jobs to worker threads
+            JobHandle.ScheduleBatchedJobs();
+
+            // Return combined handles for SpriteRenderingDrawSystem to complete
+            state.Dependency = JobHandle.CombineDependencies(syncHandles);
+            syncHandles.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Phase 2: Completes property sync jobs and draws all sprite archetypes.
+    /// Runs after SpriteRenderingUpdateSystem in the PresentationSystemGroup.
+    /// </summary>
+    [WorldSystemFilter(WorldSystemFilterFlags.Default | WorldSystemFilterFlags.Editor)]
+    [UpdateInGroup(typeof(PresentationSystemGroup))]
+    [UpdateAfter(typeof(SpriteRenderingUpdateSystem))]
+    public partial struct SpriteRenderingDrawSystem : ISystem
+    {
+        public void OnUpdate(ref SystemState state)
+        {
+            // Access the same render archetype storage (shared via entity manager)
+            var updateSystemHandle = state.World.Unmanaged.GetExistingUnmanagedSystem<SpriteRenderingUpdateSystem>();
+            var renderArchetypeStorage = SystemAPI.ManagedAPI.GetComponent<RenderArchetypeStorage>(updateSystemHandle);
+
+            // Complete all property sync jobs ONCE (batched sync point)
+            state.Dependency.Complete();
+
+            // Draw all archetypes (CompleteAndDraw now just finalizes buffers + draws)
+            for (int i = 0; i < renderArchetypeStorage.RenderArchetypes.Count; i++)
+                renderArchetypeStorage.RenderArchetypes[i].CompleteAndDraw();
         }
     }
 }

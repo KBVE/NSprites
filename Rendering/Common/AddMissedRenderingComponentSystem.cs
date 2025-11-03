@@ -4,7 +4,7 @@ using Unity.Entities;
 namespace NSprites
 {
     [UpdateInGroup(typeof(PresentationSystemGroup))]
-    [UpdateBefore(typeof(SpriteRenderingSystem))]
+    [UpdateBefore(typeof(SpriteRenderingUpdateSystem))]
     [WorldSystemFilter(WorldSystemFilterFlags.Default | WorldSystemFilterFlags.Editor | WorldSystemFilterFlags.EntitySceneOptimizations)]
     public partial struct AddMissedRenderingComponentSystem : ISystem
     {

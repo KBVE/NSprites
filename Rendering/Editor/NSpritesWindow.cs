@@ -121,7 +121,7 @@ namespace NSprites
         }
         private void UpdateWorld(World world, VisualElement root)
         {
-            var systemHandle = world.GetExistingSystem<SpriteRenderingSystem>();
+            var systemHandle = world.GetExistingSystem<SpriteRenderingUpdateSystem>();
 
             if (systemHandle == SystemHandle.Null)
                 return;
